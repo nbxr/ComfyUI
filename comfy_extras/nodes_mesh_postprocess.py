@@ -142,11 +142,18 @@ class PaintMesh(IO.ComfyNode):
         return IO.NodeOutput(out_mesh)
 
 
+def _mesh_raster_device():
+    # gfx1201: GPU UV raster / boolean index writes abort with HSA_STATUS_ERROR_EXCEPTION.
+    if torch.version.hip is not None:
+        return torch.device("cpu")
+    return comfy.model_management.get_torch_device()
+
+
 def _rasterize_uv_barycentric(faces_np, uvs_np, texture_size):
     """Rasterize the mesh in UV space (tiled point-in-triangle, pure torch). Returns per-texel
     face index [H,W], barycentric coords [H,W,3] and coverage mask [H,W], on the torch device.
     Interpolate any per-vertex attribute from these with _interp_vertex_attr."""
-    dev = comfy.model_management.get_torch_device()
+    dev = _mesh_raster_device()
     H = W = int(texture_size)
     face_idx = torch.zeros((H, W), dtype=torch.long, device=dev)
     bary = torch.zeros((H, W, 3), device=dev)
@@ -221,7 +228,7 @@ def _interp_vertex_attr(attr_v, faces, face_idx, bary, mask):
 def _bake_position_map(verts_np, faces_np, uvs_np, texture_size):
     """Barycentric-interpolate a per-vertex vec3 (world position, or any vec3 e.g. normals)
     at each covered texel. Returns (attr_map [H,W,3] float32, mask [H,W] bool)."""
-    dev = comfy.model_management.get_torch_device()
+    dev = _mesh_raster_device()
     H = W = int(texture_size)
     if faces_np.shape[0] == 0:
         return np.zeros((H, W, 3), dtype=np.float32), np.zeros((H, W), dtype=bool)
@@ -855,7 +862,7 @@ def _bake_ambient_occlusion(high_v, high_f, low_v_np, low_f_np, low_uv_np, low_n
     ray_chunk caps rays cast at once (the per-chunk BVH stack is its dominant transient VRAM);
     None auto-sizes it to a slice of free VRAM — big chunks (fast) on large GPUs, small (safe)
     on small ones."""
-    dev = comfy.model_management.get_torch_device()
+    dev = _mesh_raster_device()
     H = W = int(resolution)
     S = int(num_samples)
     if ray_chunk is None:
@@ -1169,7 +1176,7 @@ def _bake_normal_map(high_v, high_f, high_n, low_v_np, low_f_np, low_uv_np, low_
     matching high-poly surface, whose normal is projected into the texel's TBN frame.
     ignore_backfaces skips surfaces facing away (crevices/enclosures); misses fall back to
     closest-point. Returns [H,W,3] in [0,1]."""
-    dev = comfy.model_management.get_torch_device()
+    dev = _mesh_raster_device()
     H = W = int(resolution)
     flat = np.array([0.5, 0.5, 1.0], dtype=np.float32)
 
@@ -1245,7 +1252,7 @@ def _jfa_fill_gpu(img01, mask):
     (O(log n) passes; replaces cv2.inpaint). img01 [H,W,C] float, mask [H,W] bool."""
     if not mask.any():
         return img01
-    dev = comfy.model_management.get_torch_device()
+    dev = _mesh_raster_device()
     it = torch.from_numpy(np.ascontiguousarray(img01)).to(dev).float()
     mm = torch.from_numpy(np.ascontiguousarray(mask)).to(dev)
     H, W = mm.shape
@@ -1698,7 +1705,7 @@ class BakeNormalMapFromMesh(IO.ComfyNode):
                 "BakeNormalMapFromMesh: low_poly has no UVs. Connect the UV-unwrapped "
                 "low-poly (the same one you fed to BakeTextureFromVoxel); this node bakes "
                 "onto existing UVs and never unwraps.")
-        dev = comfy.model_management.get_torch_device()
+        dev = _mesh_raster_device()
 
         low_n_attr = low_poly.normals
         high_n_attr = high_poly.normals
@@ -1779,7 +1786,7 @@ class BakeAmbientOcclusion(IO.ComfyNode):
             raise ValueError(
                 "BakeAmbientOcclusion: low_poly has no UVs. Connect the UV-unwrapped low-poly "
                 "(the same one used for the other bakes); this node never unwraps.")
-        dev = comfy.model_management.get_torch_device()
+        dev = _mesh_raster_device()
         low_n_attr = low_poly.normals
         B = int(low_poly.vertices.shape[0])
         h_batch = int(high_poly.vertices.shape[0])
