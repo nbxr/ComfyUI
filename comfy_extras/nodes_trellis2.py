@@ -7,6 +7,7 @@ from comfy_extras.nodes_mesh_postprocess import pack_variable_mesh_batch
 import comfy.latent_formats
 import comfy.model_management
 import comfy.utils
+import logging
 import math
 import torch
 
@@ -32,9 +33,10 @@ def _move_sparse_tensor_uncached(tensor, device):
 
 def _sparse_vae_decode_memory(point_count, dtype):
     # Last 128-channel stage: feature intermediates plus 27 int32 neighbor indices,
-    # plus sparse-convolution workspace.
+    # plus sparse-convolution workspace. C2S upsample gathers 8 children per voxel
+    # and 1024-res surfaces need the diffusion weights fully off GPU on 16GB cards.
     bytes_per_point = 896 * comfy.model_management.dtype_size(dtype) + 27 * 4
-    return 2 * 1024 ** 3 + int(point_count) * bytes_per_point
+    return 10 * 1024 ** 3 + int(point_count) * bytes_per_point
 
 
 def infer_batched_coord_layout(coords):
@@ -597,6 +599,11 @@ class Trellis2TextureStage(IO.ComfyNode):
         coord_resolution = shape_latent.get("coord_resolution")
 
         batch_size, counts, max_tokens = infer_batched_coord_layout(coords)
+        if coord_resolution is not None and int(coord_resolution) <= 32:
+            logging.warning(
+                "Texture stage is on 512-res coords; this checkpoint's texture model is 1024. "
+                "Run Trellis2UpsampleStage at 1024 instead of bypassing it."
+            )
 
         shape_slat = shape_latent["samples"]
         if shape_slat.ndim == 4:

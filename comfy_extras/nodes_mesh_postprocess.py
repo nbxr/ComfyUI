@@ -657,6 +657,17 @@ def _back_project_positions(position_map, mask, ref_v, ref_f, max_query_res=1024
         return position_map
 
     dev = comfy.model_management.get_torch_device()
+    n_tris = int(ref_f.shape[0])
+    # Linear BVH on the raw TRELLIS decode (often millions of tris) plus a 4K
+    # position map will OOM a 16GB card. Sample remesh UV positions instead.
+    need = n_tris * 256 + 512 * 1024 * 1024
+    if comfy.model_management.get_free_memory(dev) < need:
+        logging.warning(
+            f"[BakeTextureFromVoxel] skipping high-res back-project ({n_tris} tris); "
+            "sampling remesh positions."
+        )
+        return position_map
+
     rv = ref_v.detach().to(dev).float()
     rf = ref_f.detach().to(device=dev, dtype=torch.int32)
     tri = rv[rf]
@@ -1413,8 +1424,9 @@ class BakeTextureFromVoxel(IO.ComfyNode):
     @classmethod
     def execute(cls, mesh, voxel_colors, texture_size, reference_mesh=None):
         reference_faces = _mesh_face_count(reference_mesh if reference_mesh is not None else mesh)
-        memory_required = max(texture_size * texture_size * 512, reference_faces * 512)
+        memory_required = max(texture_size * texture_size * 512, reference_faces * 512, 8 * 1024 ** 3)
         _prepare_gpu_mesh_processing(comfy.model_management.get_torch_device(), memory_required)
+        comfy.model_management.soft_empty_cache()
         voxels = voxel_colors
         coords = voxels.data
         colors = voxels.voxel_colors
@@ -2340,8 +2352,17 @@ class DecimateMesh(IO.ComfyNode):
         else:
             cfg = QEMConfig()  # midpoint defaults
 
-        # ComfyUI passes meshes on CPU (QEM much slower there); compute on device, return on original.
+        # Unload sampling weights. Full QEM builds an (F,4,4) table (~4GB on 1024-res
+        # TRELLIS meshes) and CPU fallback of that is SIGKILL'd by the OOM killer
+        # under pinned-RAM pressure. Use cluster decimate when QEM will not fit.
         compute_device = comfy.model_management.get_torch_device()
+        n_faces = _mesh_face_count(mesh)
+        memory_required = max(n_faces * 64, 8 * 1024 ** 3)
+        _prepare_gpu_mesh_processing(compute_device, memory_required)
+        comfy.model_management.soft_empty_cache()
+        free = comfy.model_management.get_free_memory(compute_device)
+        use_full_qem = free >= n_faces * 256 + 2 * 1024 ** 3
+        cluster_device = compute_device if free >= 2 * 1024 ** 3 else torch.device("cpu")
 
         counts = {"in": 0, "out": 0}
 
@@ -2349,10 +2370,17 @@ class DecimateMesh(IO.ComfyNode):
             counts["in"] += int(f.shape[0])
             if target_face_count > 0 and f.shape[0] > target_face_count:
                 src_device = v.device
-                rv, rf, rc, _rn, _rs = qem_decimate_simplify(
-                    v.to(compute_device), f.to(compute_device), int(target_face_count),
-                    colors=(c.to(compute_device) if c is not None else None),
-                    config=cfg)
+                if use_full_qem:
+                    rv, rf, rc, _rn, _rs = qem_decimate_simplify(
+                        v.to(compute_device), f.to(compute_device), int(target_face_count),
+                        colors=(c.to(compute_device) if c is not None else None),
+                        config=cfg)
+                else:
+                    target_verts = max(int(target_face_count) * 2 // 3, 1)
+                    rv, rf, rc = qem_cluster_decimate(
+                        v.to(cluster_device), f.to(cluster_device).long(),
+                        target_verts=target_verts,
+                        colors=(c.to(cluster_device) if c is not None else None))
                 v = rv.to(src_device)
                 f = rf.to(src_device)
                 if rc is not None:
