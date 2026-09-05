@@ -100,7 +100,7 @@ def _udf_exact(query_points: torch.Tensor, tri_verts: torch.Tensor,
     k=8 nearest centroids before the exact point-triangle test: on dense meshes the true
     closest triangle is essentially always within the first few neighbours. Measured vs k=16:
     bit-identical topology, ~0.003-voxel RMS sub-voxel drift, ~15% faster overall."""
-    device = query_points.device
+    orig_device = query_points.device
     F = tri_verts.shape[0]
     kq = int(min(k, F))
     if tree is None:
@@ -109,6 +109,14 @@ def _udf_exact(query_points: torch.Tensor, tri_verts: torch.Tensor,
     if cand.ndim == 1:
         cand = cand[:, None]
     cand = np.ascontiguousarray(cand)
+
+    # gfx1201: GPU _point_tri_closest aborts with HSA_STATUS_ERROR_EXCEPTION
+    # (hipErrorLaunchFailure). Point-triangle tests stay on CPU; results copy back.
+    if torch.version.hip is not None:
+        query_points = query_points.cpu()
+        tri_verts = tri_verts.cpu()
+        chunk = min(chunk, 65536)
+    device = query_points.device
 
     N = query_points.shape[0]
     out_d = torch.empty(N, device=device, dtype=query_points.dtype)
@@ -128,7 +136,7 @@ def _udf_exact(query_points: torch.Tensor, tri_verts: torch.Tensor,
         out_d[s:e] = d2[ar, best].sqrt()
         out_c[s:e] = closest[ar, best]
         out_t[s:e] = ci[ar, best]
-    return out_d, out_c, out_t
+    return out_d.to(orig_device), out_c.to(orig_device), out_t.to(orig_device)
 
 
 # UDF query via spatial hash on triangle AABBs

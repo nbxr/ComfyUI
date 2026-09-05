@@ -298,7 +298,13 @@ class VaeDecodeStructureTrellis2(IO.ComfyNode):
         decoded_batches = []
         for start in range(0, sample_tensor.shape[0], batch_number):
             sample_chunk = sample_tensor[start:start + batch_number].to(load_device)
-            decoded_batches.append(shape_vae.decode_structure(sample_chunk.to(vae.vae_dtype)) > 0)
+            occ = shape_vae.decode_structure(sample_chunk.to(vae.vae_dtype))
+            if not torch.isfinite(occ).all():
+                raise ValueError(
+                    "Structure occupancy is NaN/Inf. On gfx1201 int8_convrot checkpoints "
+                    "often produce NaNs; use trellis_2_bf16.safetensors or pixal3d_bf16.safetensors."
+                )
+            decoded_batches.append(occ.float() > 0)
         decoded = torch.cat(decoded_batches, dim=0)
         current_res = decoded.shape[2]
 
@@ -324,7 +330,7 @@ class Trellis2UpsampleStage(IO.ComfyNode):
                 IO.Conditioning.Input("negative"),
                 IO.Latent.Input("shape_latent", tooltip="The 512-resolution shape latent output from the first shape-stage KSampler."),
                 IO.Vae.Input("vae"),
-                IO.Int.Input("target_resolution", default=1024, min=1024, max=2048, step=128,
+                IO.Int.Input("target_resolution", default=1024, min=512, max=2048, step=128,
                              tooltip="Voxel resolution of the upsampled shape. Higher = more detail, more VRAM."),
             ],
             outputs=[
@@ -521,6 +527,11 @@ class Trellis2ShapeStage(IO.ComfyNode):
         decoded = voxel.data.unsqueeze(1)
         coords = torch.argwhere(decoded.bool())[:, [0, 2, 3, 4]].int()
         coord_resolution = int(decoded.shape[-1])
+        if coords.shape[0] == 0:
+            raise ValueError(
+                "Trellis2 coords can't be empty: structure occupancy has no filled voxels. "
+                "Check background removal, or use a bf16 checkpoint if this is int8_convrot on gfx1201."
+            )
 
         # Dispatch based on the upstream voxel resolution, mirroring upstream's
         # pipeline_type → ss_res table:

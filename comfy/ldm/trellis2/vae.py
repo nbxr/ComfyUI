@@ -8,6 +8,29 @@ from comfy.ldm.trellis2.flexgemm import TorchHashMap, sparse_submanifold_conv3d
 
 ops = comfy.ops.disable_weight_init
 
+# ROCm #6116: F.linear / torch.mm emits NaNs on gfx1200/gfx1201 when N > ~500k.
+# Present in torch 2.13.0+rocm7.1 and 2.14.0+rocm7.2. Remove when hipBLASLt is fixed.
+_ROCM_LINEAR_CHUNK = 131072
+
+
+def _apply_rows(module, feats):
+    n = feats.shape[0]
+    hip = torch.version.hip is not None and feats.device.type == "cuda"
+    if hip and not feats.is_contiguous():
+        feats = feats.contiguous()
+    if n <= _ROCM_LINEAR_CHUNK or not hip:
+        return module(feats)
+    arch = torch.cuda.get_device_properties(feats.device).gcnArchName
+    if "gfx1200" not in arch and "gfx1201" not in arch:
+        return module(feats)
+    first = module(feats[:_ROCM_LINEAR_CHUNK])
+    out = torch.empty((n,) + first.shape[1:], device=first.device, dtype=first.dtype)
+    out[:_ROCM_LINEAR_CHUNK] = first
+    for start in range(_ROCM_LINEAR_CHUNK, n, _ROCM_LINEAR_CHUNK):
+        end = min(start + _ROCM_LINEAR_CHUNK, n)
+        out[start:end] = module(feats[start:end])
+    return out
+
 
 def pixel_shuffle_3d(x: torch.Tensor, scale_factor: int) -> torch.Tensor:
     B, C, H, W, D = x.shape
@@ -87,7 +110,7 @@ class SparseConvNeXtBlock3d(nn.Module):
     def _forward(self, x):
         h = self.conv(x)
         h = h.replace(self.norm(h.feats))
-        h = h.replace(self.mlp(h.feats))
+        h = h.replace(_apply_rows(self.mlp, h.feats))
         h.feats.add_(x.feats.to(h.feats))
         return h
 
@@ -165,7 +188,8 @@ class SparseChannel2Spatial(nn.Module):
 
     def _apply_plan(self, x, new_coords, flat_idx, inherit_cache):
         DIM = x.coords.shape[-1] - 1
-        x_feats = x.feats.reshape(x.feats.shape[0] * self.factor ** DIM, -1)
+        factor_n = self.factor ** DIM
+        x_feats = x.feats.reshape(x.feats.shape[0] * factor_n, x.feats.shape[1] // factor_n)
         new_feats = x_feats[flat_idx]
         out = SparseTensor(new_feats, new_coords, None if x._shape is None else torch.Size([x._shape[0], x._shape[1] // self.factor ** DIM]))
         out._scale = tuple([s / self.factor for s in x._scale])
@@ -198,10 +222,19 @@ class SparseResBlockC2S3d(nn.Module):
         h = x.replace(self.norm1(x.feats))
         h = h.replace(F.silu(h.feats, inplace=True))
         h = self.conv1(h)
-        subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
+        # gfx1201: compare occupancy logits in fp32. fp16/bf16 > 0 can drop every
+        # child voxel and leave an empty sparse tensor (ROCm TRELLIS.2 workaround).
+        subdiv_binarized = subdiv.replace(subdiv.feats.float() > 0) if subdiv is not None else None
         new_coords, flat_idx, inherit_cache = self.updown._subdivision_plan(h, subdiv_binarized)
+        if new_coords.shape[0] == 0:
+            if subdiv is not None and not torch.isfinite(subdiv.feats).all():
+                raise ValueError(
+                    "Trellis2 upsample occupancy logits are NaN/Inf. On gfx1201 int8_convrot "
+                    "Trellis2 often produces NaNs; use trellis_2_bf16.safetensors."
+                )
+            raise ValueError("Trellis2 upsample occupancy dropped all voxels.")
         h = self.updown._apply_plan(h, new_coords, flat_idx, inherit_cache)
-        skip_feats = x.feats.reshape(x.feats.shape[0] * 8, -1)[flat_idx]
+        skip_feats = x.feats.reshape(x.feats.shape[0] * 8, x.feats.shape[1] // 8)[flat_idx]
         del x, new_coords, flat_idx, subdiv_binarized
         h = h.replace(self.norm2(h.feats))
         h = h.replace(F.silu(h.feats, inplace=True))
@@ -489,10 +522,8 @@ class SparseTensor(VarLenTensor):
         return len(self.layout)
 
     def __cal_shape(self, feats, coords):
-        shape = []
-        shape.append(coords[:, 0].max().item() + 1)
-        shape.extend([*feats.shape[1:]])
-        return torch.Size(shape)
+        batch = 0 if coords.shape[0] == 0 else coords[:, 0].max().item() + 1
+        return torch.Size([batch, *feats.shape[1:]])
 
     def __cal_layout(self, coords, batch_size):
         seq_len = torch.bincount(coords[:, 0], minlength=batch_size)
@@ -501,6 +532,8 @@ class SparseTensor(VarLenTensor):
         return layout
 
     def __cal_spatial_shape(self, coords):
+        if coords.shape[0] == 0:
+            return torch.Size([0] * (coords.shape[1] - 1))
         return torch.Size((coords[:, 1:].max(0)[0] + 1).tolist())
 
     @property
@@ -748,7 +781,7 @@ class SparseLinear:
                 super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
 
             def forward(self, input: VarLenTensor) -> VarLenTensor:
-                return input.replace(super().forward(input.feats))
+                return input.replace(_apply_rows(super().forward, input.feats))
 
         return _SparseLinear(in_features, out_features, bias=bias, device=device, dtype=dtype, *args, **kwargs)
 
@@ -820,6 +853,13 @@ class SparseUnetVaeDecoder(nn.Module):
             return h
 
     def upsample(self, x: SparseTensor, upsample_times: int) -> torch.Tensor:
+        if x.feats.numel() == 0:
+            raise ValueError("Trellis2 upsample got empty shape latents.")
+        if not torch.isfinite(x.feats).all():
+            raise ValueError(
+                "Trellis2 upsample got NaN/Inf shape latents. On gfx1201 int8_convrot "
+                "Trellis2 often produces NaNs; use trellis_2_bf16.safetensors."
+            )
         h = self.from_latent(x)
         for i, res in enumerate(self.blocks):
             if i == upsample_times:
@@ -862,7 +902,7 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
         h = out_list[0]
         vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
-        intersected = h.replace(h.feats[..., 3:6] > 0)
+        intersected = h.replace(h.feats[..., 3:6].float() > 0)
         quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
         mesh = [flexible_dual_grid_to_mesh(
             v.coords[:, 1:], v.feats, i.feats, q.feats,

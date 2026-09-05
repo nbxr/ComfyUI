@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import comfy.model_management
 import comfy.ops
-from comfy.ldm.trellis2.vae import SparseTensor, SparseLinear, sparse_cat, VarLenTensor
+from comfy.ldm.trellis2.vae import SparseTensor, SparseLinear, sparse_cat, VarLenTensor, _apply_rows
 from typing import Optional, Tuple, Literal, Union, List
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.genmo.joint_model.layers import TimestepEmbedder
@@ -172,9 +172,9 @@ class SparseMultiHeadAttention(nn.Module):
     @staticmethod
     def _linear(module: nn.Linear, x: Union[VarLenTensor, torch.Tensor]) -> Union[VarLenTensor, torch.Tensor]:
         if isinstance(x, VarLenTensor):
-            return x.replace(module(x.feats))
+            return x.replace(_apply_rows(module, x.feats))
         else:
-            return module(x)
+            return _apply_rows(module, x)
 
     @staticmethod
     def _reshape_chs(x: Union[VarLenTensor, torch.Tensor], shape: Tuple[int, ...]) -> Union[VarLenTensor, torch.Tensor]:

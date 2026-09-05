@@ -132,6 +132,9 @@ def sparse_submanifold_conv3d(
     N_pts = feats.shape[0]
 
     weight_T = weight.view(Co, V * Ci).T
+    # gfx1201: non-contiguous B in torch.matmul can corrupt GEMM output (ROCm #6116).
+    if torch.version.hip is not None:
+        weight_T = weight_T.contiguous()
 
     output = torch.empty(N_pts, Co, device=device, dtype=feats.dtype)
 
@@ -141,6 +144,8 @@ def sparse_submanifold_conv3d(
     max_chunk_mem = max_chunk_mem_gb * (1024 ** 3)
     chunk_size = max(1, int(max_chunk_mem / mem_per_row))
     chunk_size = min(chunk_size, N_pts)
+    if torch.version.hip is not None:
+        chunk_size = min(chunk_size, 131072)
 
     for start in range(0, N_pts, chunk_size):
         end = min(start + chunk_size, N_pts)

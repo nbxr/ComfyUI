@@ -318,8 +318,10 @@ def lscm_charts_batch(
         cval = np.zeros((B, N), dtype=np.float64)
         np.put_along_axis(cval, pin_cols, pin_vals, axis=1)
 
-        # normal equations + batched solve; the fp64 dense algebra goes to the GPU when available
-        use_gpu = device is not None and device.type == "cuda"
+        # normal equations + batched solve; the fp64 dense algebra goes to the GPU when available.
+        # hipBLAS batched getrf (torch.linalg.solve) fails with HIPBLAS_STATUS_ALLOC_FAILED
+        # on ROCm even when PyTorch reports free VRAM, so AMD stays on numpy.
+        use_gpu = device is not None and device.type == "cuda" and torch.version.hip is None
         if use_gpu:
             A_t = torch.from_numpy(A).to(device)
             At = A_t.transpose(1, 2)
