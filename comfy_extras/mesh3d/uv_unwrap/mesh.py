@@ -65,6 +65,10 @@ class MeshData:
 
 def build_mesh(vertices: Tensor, faces: Tensor) -> MeshData:
     """Build adjacency; non-manifold edges (>2 incident faces) get no neighbor and act as boundary."""
+    # gfx1201: boolean index / nonzero aborts with HSA_STATUS_ERROR_EXCEPTION.
+    if torch.version.hip is not None and (vertices.is_cuda or faces.is_cuda):
+        vertices = vertices.cpu()
+        faces = faces.cpu()
     if vertices.dtype != torch.float32:
         vertices = vertices.to(torch.float32)
     if faces.dtype != torch.long:

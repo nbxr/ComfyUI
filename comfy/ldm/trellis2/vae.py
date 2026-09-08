@@ -4,13 +4,14 @@ import torch.nn.functional as F
 from fractions import Fraction
 from typing import List, Any, Dict, Optional, overload, Union
 import comfy.ops
+import comfy.model_management
 from comfy.ldm.trellis2.flexgemm import TorchHashMap, sparse_submanifold_conv3d
 
 ops = comfy.ops.disable_weight_init
 
 # ROCm #6116: F.linear / torch.mm emits NaNs on gfx1200/gfx1201 when N > ~500k.
 # Present in torch 2.13.0+rocm7.1 and 2.14.0+rocm7.2. Remove when hipBLASLt is fixed.
-_ROCM_LINEAR_CHUNK = 131072
+_ROCM_LINEAR_CHUNK = 65536
 
 
 def _apply_rows(module, feats):
@@ -68,7 +69,7 @@ def sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, d
     self.weight = nn.Parameter(self.weight.permute(0, 2, 3, 4, 1).contiguous())
 
 
-def sparse_conv3d_forward(self, x):
+def sparse_conv3d_forward(self, x, output_device=None):
     # check if neighbor map is already computed
     Co, Kd, Kh, Kw, Ci = self.weight.shape
     neighbor_cache_key = f'SubMConv3d_neighbor_cache_{Kw}x{Kh}x{Kd}_dilation{self.dilation}'
@@ -86,13 +87,17 @@ def sparse_conv3d_forward(self, x):
         neighbor_cache,
         self.dilation,
         self.cache_neighbor_map,
+        output_device=output_device,
     )
 
-    if neighbor_cache is None and neighbor_cache_ is not None:
+    if neighbor_cache is None and neighbor_cache_ is not None and out.device == x.feats.device:
         x.register_spatial_cache(neighbor_cache_key, neighbor_cache_)
 
-    out = x.replace(out)
-    return out
+    if out.device != x.coords.device:
+        result = SparseTensor(out, x.coords.to(out.device), x._shape)
+        result._scale = x._scale
+        return result
+    return x.replace(out)
 
 class SparseConvNeXtBlock3d(nn.Module):
     def __init__(self, channels: int, mlp_ratio: float = 4.0):
@@ -176,6 +181,10 @@ class SparseChannel2Spatial(nn.Module):
             flat_idx = subdivision.feats.flatten().nonzero(as_tuple=True)[0]
             idx = torch.div(flat_idx, self.factor ** DIM, rounding_mode='floor')
             subidx = flat_idx.remainder(self.factor ** DIM)
+            if idx.device != x.coords.device:
+                idx = idx.to(x.coords.device)
+                subidx = subidx.to(x.coords.device)
+                flat_idx = flat_idx.to(x.coords.device)
             new_coords = x.coords[idx]
             new_coords[:, 1:] *= self.factor
             for i in range(DIM):
@@ -221,26 +230,55 @@ class SparseResBlockC2S3d(nn.Module):
             subdiv = self.to_subdiv(x)
         h = x.replace(self.norm1(x.feats))
         h = h.replace(F.silu(h.feats, inplace=True))
-        h = self.conv1(h)
-        # gfx1201: compare occupancy logits in fp32. fp16/bf16 > 0 can drop every
-        # child voxel and leave an empty sparse tensor (ROCm TRELLIS.2 workaround).
-        subdiv_binarized = subdiv.replace(subdiv.feats.float() > 0) if subdiv is not None else None
+        orig_device = h.feats.device
+        conv1_bytes = h.feats.shape[0] * self.out_channels * 8 * h.feats.element_size()
+        out_dev = orig_device
+        if orig_device.type == "cuda" and conv1_bytes > comfy.model_management.get_free_memory(orig_device) // 2:
+            out_dev = torch.device("cpu")
+        h = sparse_conv3d_forward(self.conv1, h, output_device=out_dev)
+        # gfx1201: compare occupancy in fp32. +inf is occupied (same as inf > 0).
+        # All-NaN occupancy used to keep only child 0 of every parent, which
+        # turns a solid into a grid of disconnected cubes.
+        if subdiv is not None:
+            logits = subdiv.feats.float()
+            keep = (logits > 0) | torch.isposinf(logits)
+            if not keep.any():
+                if not torch.isfinite(logits).any():
+                    keep = torch.ones_like(keep)
+                else:
+                    raise ValueError("Trellis2 upsample occupancy dropped all voxels.")
+            subdiv_binarized = subdiv.replace(keep)
+        else:
+            subdiv_binarized = None
         new_coords, flat_idx, inherit_cache = self.updown._subdivision_plan(h, subdiv_binarized)
         if new_coords.shape[0] == 0:
-            if subdiv is not None and not torch.isfinite(subdiv.feats).all():
-                raise ValueError(
-                    "Trellis2 upsample occupancy logits are NaN/Inf. On gfx1201 int8_convrot "
-                    "Trellis2 often produces NaNs; use trellis_2_bf16.safetensors."
-                )
             raise ValueError("Trellis2 upsample occupancy dropped all voxels.")
-        h = self.updown._apply_plan(h, new_coords, flat_idx, inherit_cache)
-        skip_feats = x.feats.reshape(x.feats.shape[0] * 8, x.feats.shape[1] // 8)[flat_idx]
-        del x, new_coords, flat_idx, subdiv_binarized
+        skip_src = x.feats
+        skip_idx = flat_idx.to(skip_src.device)
+        skip_bytes = skip_idx.shape[0] * (skip_src.shape[1] // 8) * skip_src.element_size()
+        if skip_src.device.type == "cuda" and skip_bytes > comfy.model_management.get_free_memory(skip_src.device) // 2:
+            skip_src = skip_src.to("cpu")
+            skip_idx = skip_idx.to("cpu")
+        skip_feats = skip_src.reshape(skip_src.shape[0] * 8, skip_src.shape[1] // 8)[skip_idx]
+        if h.feats.device != orig_device:
+            flat_idx = flat_idx.to(h.feats.device)
+            new_coords_f = new_coords.to(h.feats.device)
+            h = self.updown._apply_plan(h, new_coords_f, flat_idx, inherit_cache)
+            copy_bytes = h.feats.numel() * h.feats.element_size()
+            if orig_device.type == "cuda" and copy_bytes <= comfy.model_management.get_free_memory(orig_device) // 2:
+                scale = h._scale
+                h = SparseTensor(h.feats.to(orig_device), new_coords.to(orig_device), h._shape)
+                h._scale = scale
+        else:
+            h = self.updown._apply_plan(h, new_coords, flat_idx, inherit_cache)
+        del x, new_coords, flat_idx, subdiv_binarized, skip_src, skip_idx
         h = h.replace(self.norm2(h.feats))
         h = h.replace(F.silu(h.feats, inplace=True))
         h = self.conv2(h)
         skip_repeat = self.out_channels // (self.channels // 8)
-        h.feats.view(h.feats.shape[0], skip_feats.shape[1], skip_repeat).add_(skip_feats.to(h.feats.dtype).unsqueeze(-1))
+        h.feats.view(h.feats.shape[0], skip_feats.shape[1], skip_repeat).add_(
+            skip_feats.to(device=h.feats.device, dtype=h.feats.dtype).unsqueeze(-1)
+        )
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -835,7 +873,12 @@ class SparseUnetVaeDecoder(nn.Module):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
                     if self.pred_subdiv:
                         h, sub = block(h)
-                        subs.append(SparseTensor(feats=sub.feats, coords=sub.coords, shape=sub.shape, scale=sub._scale))
+                        subs.append(SparseTensor(
+                            feats=sub.feats.cpu(),
+                            coords=sub.coords.cpu(),
+                            shape=sub.shape,
+                            scale=sub._scale,
+                        ))
                     else:
                         h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
                 else:

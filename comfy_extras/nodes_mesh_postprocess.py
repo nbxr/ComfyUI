@@ -32,6 +32,11 @@ def _mesh_face_count(mesh):
 
 
 def _prepare_gpu_mesh_processing(device, memory_required):
+    # Dynamic.detach leaves the AIMDO VBAR mapped; free it before mesh work.
+    for loaded in list(comfy.model_management.current_loaded_models):
+        patcher = loaded.model
+        if patcher is not None and patcher.is_dynamic():
+            patcher.partially_unload(patcher.offload_device, 1e30)
     comfy.model_management.free_memory(
         int(memory_required) + comfy.model_management.minimum_inference_memory(),
         device,
@@ -663,10 +668,17 @@ def _back_project_positions(position_map, mask, ref_v, ref_f, max_query_res=1024
     if not mask.any():
         return position_map
 
-    dev = comfy.model_management.get_torch_device()
     n_tris = int(ref_f.shape[0])
-    # Linear BVH on the raw TRELLIS decode (often millions of tris) plus a 4K
-    # position map will OOM a 16GB card. Sample remesh UV positions instead.
+    # gfx1201: GPU LBVH (delta / msb / boolean index) aborts with
+    # HSA_STATUS_ERROR_EXCEPTION. The VRAM check is not enough; skip on ROCm.
+    if torch.version.hip is not None:
+        logging.warning(
+            f"[BakeTextureFromVoxel] skipping high-res back-project on ROCm ({n_tris} tris); "
+            "sampling remesh positions."
+        )
+        return position_map
+
+    dev = comfy.model_management.get_torch_device()
     need = n_tris * 256 + 512 * 1024 * 1024
     if comfy.model_management.get_free_memory(dev) < need:
         logging.warning(
@@ -2368,8 +2380,9 @@ class DecimateMesh(IO.ComfyNode):
         _prepare_gpu_mesh_processing(compute_device, memory_required)
         comfy.model_management.soft_empty_cache()
         free = comfy.model_management.get_free_memory(compute_device)
-        use_full_qem = free >= n_faces * 256 + 2 * 1024 ** 3
-        cluster_device = compute_device if free >= 2 * 1024 ** 3 else torch.device("cpu")
+        # gfx1201: GPU unique/scatter_reduce in cluster decimate can emit 0 faces.
+        use_full_qem = torch.version.hip is None and free >= n_faces * 256 + 2 * 1024 ** 3
+        cluster_device = torch.device("cpu") if torch.version.hip is not None or free < 2 * 1024 ** 3 else compute_device
 
         counts = {"in": 0, "out": 0}
 
@@ -2388,14 +2401,18 @@ class DecimateMesh(IO.ComfyNode):
                         v.to(cluster_device), f.to(cluster_device).long(),
                         target_verts=target_verts,
                         colors=(c.to(cluster_device) if c is not None else None))
-                v = rv.to(src_device)
-                f = rf.to(src_device)
-                if rc is not None:
-                    c = rc.to(src_device)
+                if rf.shape[0] == 0:
+                    logging.warning("DecimateMesh produced 0 faces; keeping the input mesh.")
+                else:
+                    v = rv.to(src_device)
+                    f = rf.to(src_device)
+                    if rc is not None:
+                        c = rc.to(src_device)
             counts["out"] += int(f.shape[0])
             return v, f, c
 
         result = _process_mesh_batch(mesh, _fn)
+        comfy.model_management.soft_empty_cache()
 
         # Display the face reduction on the node
         if cls.hidden.unique_id:
@@ -2472,9 +2489,9 @@ class RemeshMesh(IO.ComfyNode):
         drop_enclosed_components = bool(sign_mode.get("drop_enclosed_components", False))
 
         # ComfyUI passes meshes on CPU (remesh far faster on GPU); compute on device, return on original.
-        compute_device = comfy.model_management.get_torch_device()
+        compute_device = torch.device("cpu") if torch.version.hip is not None else comfy.model_management.get_torch_device()
         memory_required = max(resolution ** 3 * 64, _mesh_face_count(mesh) * 512)
-        _prepare_gpu_mesh_processing(compute_device, memory_required)
+        _prepare_gpu_mesh_processing(comfy.model_management.get_torch_device(), memory_required)
         counts = {"in": 0, "out": 0}
 
         def _fn(v, f, c):
@@ -2512,6 +2529,7 @@ class RemeshMesh(IO.ComfyNode):
             return v, f, c
 
         result = _process_mesh_batch(mesh, _fn)
+        comfy.model_management.soft_empty_cache()
 
         # Display the face change on the node
         if cls.hidden.unique_id:
@@ -2583,6 +2601,10 @@ def _uv_unwrap(positions, indices, segmenter, resolution, padding, weld_distance
     t_start = time.perf_counter()
     # phase-weighted node progress: weld/mesh 2%, segment 33%, extract 5%, param 25%, pack 33%
     pbar = comfy.utils.ProgressBar(1000)
+    # gfx1201: GPU unique/nonzero/boolean-index in build_mesh abort the HIP queue.
+    if torch.version.hip is not None:
+        positions = positions.cpu()
+        indices = indices.cpu()
     v_in = positions.to(torch.float32)
     f_in = indices.to(torch.long).reshape(-1, 3)
     v_in, f_in, welded_to_orig = _uv_weld_vertices(v_in, f_in, weld_distance)
@@ -2782,7 +2804,9 @@ class UnwrapMesh(IO.ComfyNode):
     def execute(cls, mesh, segmenter, resolution, padding, weld_distance):
         compute_device = comfy.model_management.get_torch_device()
         _prepare_gpu_mesh_processing(compute_device, _mesh_face_count(mesh) * 14 * 1024)
-        seg_device = compute_device if segmenter == "pec" else torch.device("cpu")
+        # gfx1201: pec's torch.unique / boolean index abort the HIP queue.
+        seg_device = torch.device("cpu") if torch.version.hip is not None else (
+            compute_device if segmenter == "pec" else torch.device("cpu"))
 
         is_list = isinstance(mesh.vertices, list)
         is_batched = not is_list and mesh.vertices.ndim == 3

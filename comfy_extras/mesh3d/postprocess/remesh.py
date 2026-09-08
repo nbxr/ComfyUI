@@ -9,6 +9,7 @@ filter components, fix poles, smooth, and interpolate vertex colors.
 from __future__ import annotations
 
 import functools
+import logging
 import math
 from typing import Optional, Tuple
 
@@ -16,6 +17,7 @@ import numpy as np
 import torch
 import scipy.spatial
 import comfy.utils
+import comfy.model_management
 from tqdm import tqdm as _tqdm
 from comfy.model_management import throw_exception_if_processing_interrupted
 
@@ -101,7 +103,13 @@ def _udf_exact(query_points: torch.Tensor, tri_verts: torch.Tensor,
     closest triangle is essentially always within the first few neighbours. Measured vs k=16:
     bit-identical topology, ~0.003-voxel RMS sub-voxel drift, ~15% faster overall."""
     orig_device = query_points.device
-    F = tri_verts.shape[0]
+    N = int(query_points.shape[0])
+    F = int(tri_verts.shape[0])
+    if N == 0 or F == 0:
+        inf = torch.full((N,), float("inf"), device=orig_device, dtype=query_points.dtype)
+        closest = query_points.new_zeros((N, 3))
+        tri_idx = torch.full((N,), -1, device=orig_device, dtype=torch.long)
+        return inf, closest, tri_idx
     kq = int(min(k, F))
     if tree is None:
         tree = _build_centroid_tree(tri_verts)
@@ -284,6 +292,8 @@ def _build_narrow_band_voxels(verts: torch.Tensor, faces: torch.Tensor,
                               progress_callback=None) -> torch.Tensor:
     """Voxel coords (Nv,3) in 0..resolution-1 whose centre is within ~0.87 cell_size of the surface; also returns the kept cKDTree."""
     device = verts.device
+    if faces.numel() == 0 or verts.numel() == 0:
+        return torch.empty((0, 3), dtype=torch.long, device=device), None
     tri_verts = verts[faces.long()]
     # Exact UDF; build the centroid cKDTree once and reuse across refinement levels
     tree = _build_centroid_tree(tri_verts)
@@ -303,6 +313,10 @@ def _build_narrow_band_voxels(verts: torch.Tensor, faces: torch.Tensor,
     current_res = base_resolution
     while True:
         throw_exception_if_processing_interrupted()
+        if coords.numel() == 0:
+            if progress_callback is not None:
+                progress_callback()
+            break
         cell_size = scale / current_res
         pts = ((coords.float() + 0.5) / current_res - 0.5) * scale + center
         dists, _, _ = _udf_exact(pts, tri_verts, tree=tree)
@@ -329,8 +343,20 @@ def _dual_contour(voxel_coords: torch.Tensor, corner_udf: torch.Tensor,
                   corner_valid: Optional[torch.Tensor] = None,
                   ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dual contour active voxels; returns (Nv,3) dual verts and (M,3) faces into them. QEF placement when tri_face_normals+qef_query given, else centroid of crossings."""
-    device = voxel_coords.device
+    orig_device = voxel_coords.device
     Nv = voxel_coords.shape[0]
+    # (Nv,8,3) long + (Nv,12,3) float crossings; a cube band at res 768 is tens of millions of voxels.
+    need = Nv * 8 * 24 + Nv * 12 * 12
+    if orig_device.type == "cuda" and need > comfy.model_management.get_free_memory(orig_device) // 2:
+        voxel_coords = voxel_coords.cpu()
+        corner_udf = corner_udf.cpu()
+        corner_keys = corner_keys.cpu()
+        center = center.cpu()
+        if tri_face_normals is not None:
+            tri_face_normals = tri_face_normals.cpu()
+        if corner_valid is not None:
+            corner_valid = corner_valid.cpu()
+    device = voxel_coords.device
     # 8 corners per voxel, packed into a 1d key
     CORNER_OFFS = torch.tensor([
         [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
@@ -483,8 +509,13 @@ def _dual_contour(voxel_coords: torch.Tensor, corner_udf: torch.Tensor,
         tris.append(t2)
 
     if not tris:
-        return dual_verts, torch.empty((0, 3), dtype=torch.long, device=device)
+        empty = torch.empty((0, 3), dtype=torch.long, device=device)
+        if orig_device != device:
+            return dual_verts.to(orig_device), empty.to(orig_device)
+        return dual_verts, empty
     new_faces = torch.cat(tris, dim=0)
+    if orig_device != device:
+        return dual_verts.to(orig_device), new_faces.to(orig_device)
     return dual_verts, new_faces
 
 
@@ -814,6 +845,12 @@ def _taubin_smooth(verts: torch.Tensor, faces: torch.Tensor,
     """Taubin lambda|mu low-pass smoothing (volume-preserving); boundary verts are no-ops."""
     if iters <= 0 or verts.numel() == 0 or faces.numel() == 0:
         return verts
+    orig_device = verts.device
+    # 3 halfedge copies of faces; cube remesh at 768 can be tens of millions of tris.
+    need = faces.shape[0] * 3 * 2 * 8 * 3
+    if orig_device.type == "cuda" and need > comfy.model_management.get_free_memory(orig_device) // 2:
+        verts = verts.cpu()
+        faces = faces.cpu()
     device = verts.device
     V = verts.shape[0]
     sorted_keys, _, _ = _sorted_edge_halfedges(faces, V)
@@ -950,6 +987,9 @@ def remesh_narrow_band_dc(
     """
     assert vertices.ndim == 2 and vertices.shape[1] == 3
     assert faces.ndim == 2 and faces.shape[1] == 3
+    if vertices.shape[0] == 0 or faces.shape[0] == 0:
+        logging.warning("Remesh input is empty; keeping the input mesh.")
+        return vertices, faces, colors
     device = vertices.device
 
     if center is None:
@@ -994,23 +1034,38 @@ def remesh_narrow_band_dc(
         vertices, faces, center, scale, resolution, eps,
         progress_callback=tick)
     if voxel_coords.numel() == 0:
-        return (torch.empty((0, 3), dtype=vertices.dtype, device=device),
-                torch.empty((0, 3), dtype=faces.dtype, device=device),
-                None if colors is None else torch.empty((0, colors.shape[1]),
-                                                        dtype=colors.dtype, device=device))
+        logging.warning("Remesh narrow band was empty; keeping the input mesh.")
+        return vertices, faces, colors
 
-    # Step 2: collect unique corner positions of all active voxels
+    # Step 2: unique corners of active voxels. Do not materialize N×8 on GPU —
+    # a cube at res 768 has tens of millions of band voxels (~7GB for that tensor).
     CORNER_OFFS = torch.tensor([
         [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
         [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1],
     ], dtype=torch.long, device=device)
-    corners = (voxel_coords.unsqueeze(1) + CORNER_OFFS.unsqueeze(0)).reshape(-1, 3)
     R1 = resolution + 1
-    corner_keys = (corners[:, 0] * R1 + corners[:, 1]) * R1 + corners[:, 2]
-    unique_corner_keys, corner_inv = torch.unique(corner_keys, return_inverse=True)
-    unique_corners = torch.zeros((unique_corner_keys.shape[0], 3), dtype=torch.long, device=device)
-    unique_corners[corner_inv] = corners
-    del corners, corner_keys, corner_inv
+    n_vox = voxel_coords.shape[0]
+    corner_bytes = n_vox * 8 * 3 * 8
+    work, offs = voxel_coords, CORNER_OFFS
+    if device.type == "cuda" and corner_bytes > comfy.model_management.get_free_memory(device) // 2:
+        work = voxel_coords.cpu()
+        offs = CORNER_OFFS.cpu()
+    chunk = 1 << 20
+    key_parts = []
+    for s in range(0, n_vox, chunk):
+        e = min(s + chunk, n_vox)
+        c = (work[s:e].unsqueeze(1) + offs).reshape(-1, 3)
+        key_parts.append((c[:, 0] * R1 + c[:, 1]) * R1 + c[:, 2])
+    unique_corner_keys = torch.unique(torch.cat(key_parts))
+    unique_corners = torch.stack((
+        unique_corner_keys // (R1 * R1),
+        (unique_corner_keys // R1) % R1,
+        unique_corner_keys % R1,
+    ), dim=1)
+    if unique_corners.device != device:
+        unique_corner_keys = unique_corner_keys.to(device)
+        unique_corners = unique_corners.to(device)
+    del work, offs, key_parts
 
     if sign_mode == "sdf":
         use_sdf = True
@@ -1080,6 +1135,10 @@ def remesh_narrow_band_dc(
     if use_sdf or qef:
         del tri_face_normals_all
     tick()  # DC done
+
+    if new_faces.numel() == 0:
+        logging.warning("Remesh dual contour produced no faces; keeping the input mesh.")
+        return vertices, faces, colors
 
     # Step 6: project_back and / or color sampling share one closest-point query
     need_query = (project_back > 0 or colors is not None) and dual_verts.numel() > 0
@@ -1152,10 +1211,14 @@ def remesh_narrow_band_dc(
                                     lam=float(smooth_lambda),
                                     mu=float(smooth_mu),
                                     progress_callback=tick)
+        if new_faces.device != dual_verts.device:
+            new_faces = new_faces.to(dual_verts.device)
+            if out_colors is not None:
+                out_colors = out_colors.to(dual_verts.device)
 
     # Drop unused verts (non-crossing voxels' dual verts) and compact faces
     if dual_verts.numel() > 0 and new_faces.numel() > 0:
-        used = torch.zeros(dual_verts.shape[0], dtype=torch.bool, device=device)
+        used = torch.zeros(dual_verts.shape[0], dtype=torch.bool, device=dual_verts.device)
         used[new_faces[:, 0]] = True
         used[new_faces[:, 1]] = True
         used[new_faces[:, 2]] = True

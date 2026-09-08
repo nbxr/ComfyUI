@@ -876,6 +876,18 @@ def _weld_vertices(
     """Merge vertices closer than epsilon (L_inf grid), cluster-averaging attributes; returns (v, f, colors, normals, n_welded)."""
     if verts.shape[0] == 0:
         return verts, faces, colors, normals, 0
+    # gfx1201: torch.unique on CUDA keys aborts with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION.
+    if torch.version.hip is not None and verts.device.type == "cuda":
+        src = verts.device
+        eps = epsilon.item() if torch.is_tensor(epsilon) else float(epsilon)
+        v, f, c, n, nw = _weld_vertices(
+            verts.cpu(), faces.cpu(), eps,
+            None if colors is None else colors.cpu(),
+            None if normals is None else normals.cpu(),
+        )
+        return (v.to(src), f.to(src),
+                None if c is None else c.to(src),
+                None if n is None else n.to(src), nw)
     device = verts.device
     scale = 1.0 / epsilon
     bbox_min = verts.min(dim=0)[0]
@@ -1218,6 +1230,18 @@ def qem_simplify(
     config: Optional[QEMConfig] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], SimplifyStats]:
     """Single-mesh QEM simplification. Returns (v, f, colors, normals, stats)."""
+    # gfx1201: CUB unique / scatter on CUDA keys abort the HIP queue.
+    if torch.version.hip is not None and vertices.device.type == "cuda":
+        src = vertices.device
+        v, f, c, n, s = qem_simplify(
+            vertices.cpu(), faces.cpu(), target_faces,
+            None if colors is None else colors.cpu(),
+            None if normals is None else normals.cpu(),
+            max_edge_length, config)
+        return (v.to(src), f.to(src),
+                None if c is None else c.to(src),
+                None if n is None else n.to(src), s)
+
     cfg = config or QEMConfig()
 
     device = vertices.device
@@ -1643,6 +1667,12 @@ def qem_cluster_decimate(
     drop degenerate/duplicate. Fast O(V+F) prepass for huge meshes. Returns (verts, faces, colors)."""
     if vertices.shape[0] == 0 or faces.shape[0] == 0:
         return vertices, faces, colors
+    if torch.version.hip is not None and vertices.device.type == "cuda":
+        src = vertices.device
+        v, f, c = qem_cluster_decimate(
+            vertices.cpu(), faces.cpu(), target_verts,
+            None if colors is None else colors.cpu(), face_chunk)
+        return v.to(src), f.to(src), None if c is None else c.to(src)
 
     device = vertices.device
     bbox = vertices.max(dim=0)[0] - vertices.min(dim=0)[0]
@@ -1692,14 +1722,9 @@ def qem_cluster_decimate(
 
     # drop duplicate faces (same vertex set after clustering)
     if new_faces.numel() > 0:
-        key_sorted = torch.sort(new_faces, dim=1)[0]
-        P = n_unique + 1
-        packed = (key_sorted[:, 0].long() * P + key_sorted[:, 1].long()) * P + key_sorted[:, 2].long()
-        _, first = torch.unique(packed, return_inverse=True)
-        arange = torch.arange(packed.shape[0], device=device, dtype=torch.int64)
-        first_idx = torch.full((int(first.max().item()) + 1,), packed.shape[0],
-                               dtype=torch.int64, device=device)
-        first_idx.scatter_reduce_(0, first, arange, reduce="amin", include_self=True)
-        new_faces = new_faces[first_idx]
+        new_faces = torch.unique(torch.sort(new_faces, dim=1)[0], dim=0)
+
+    if new_faces.shape[0] == 0:
+        return vertices, faces, colors
 
     return new_verts.to(vertices.dtype), new_faces.to(faces.dtype), new_colors

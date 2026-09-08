@@ -7,6 +7,7 @@ from comfy_extras.nodes_mesh_postprocess import pack_variable_mesh_batch
 import comfy.latent_formats
 import comfy.model_management
 import comfy.utils
+import gc
 import logging
 import math
 import torch
@@ -29,6 +30,38 @@ def _move_sparse_tensor_uncached(tensor, device):
         shape=tensor.shape,
         scale=tensor._scale,
     )
+
+
+def _to_intermediate(value):
+    device = comfy.model_management.intermediate_device()
+    if torch.is_tensor(value) and value.device != device:
+        return value.to(device)
+    return value
+
+
+def _release_dynamic_vbar(patcher):
+    # LoadedModel.model_unload(1e30) skips partially_unload (1e30 is never
+    # < loaded_size) and Dynamic.detach does not free the AIMDO VBAR.
+    if patcher is not None and patcher.is_dynamic():
+        patcher.partially_unload(patcher.offload_device, 1e30)
+
+
+def _unload_patcher(patcher):
+    gc.collect()
+    _release_dynamic_vbar(patcher)
+    if patcher is not None:
+        comfy.model_management.unload_model_and_clones(patcher)
+    comfy.model_management.soft_empty_cache()
+
+
+def _free_gpu():
+    # Dynamic-VRAM models keep an AIMDO VBAR after detach. Free those first
+    # so the next stage actually sees an empty 16GB card.
+    gc.collect()
+    for loaded in list(comfy.model_management.current_loaded_models):
+        _release_dynamic_vbar(loaded.model)
+    comfy.model_management.free_memory(1e30, comfy.model_management.get_torch_device())
+    comfy.model_management.soft_empty_cache()
 
 
 def _sparse_vae_decode_memory(point_count, dtype):
@@ -146,6 +179,7 @@ class VaeDecodeShapeTrellis(IO.ComfyNode):
         device = comfy.model_management.get_torch_device()
         coords = samples["coords"]
         surface_point_estimate = resolution * resolution * 5 // 4
+        _free_gpu()
         vae.prepare_decode(
             sample_tensor.shape,
             memory_required=_sparse_vae_decode_memory(surface_point_estimate, vae.vae_dtype),
@@ -184,12 +218,15 @@ class VaeDecodeShapeTrellis(IO.ComfyNode):
         else:
             vert_list = [v.float().cpu() for v, _ in mesh]
         face_list = [f.int().cpu() for _, f in mesh]
+        del mesh
         if all(v.shape == vert_list[0].shape for v in vert_list) and all(f.shape == face_list[0].shape for f in face_list):
             mesh = Types.MESH(vertices=torch.stack(vert_list), faces=torch.stack(face_list))
         else:
             mesh = pack_variable_mesh_batch(vert_list, face_list)
         output_device = comfy.model_management.intermediate_device()
         subs = [_move_sparse_tensor_uncached(sub, output_device) for sub in subs]
+        del samples, coords, trellis_vae
+        _unload_patcher(vae.patcher)
         return IO.NodeOutput(mesh, subs)
 
 class VaeDecodeTextureTrellis(IO.ComfyNode):
@@ -217,6 +254,7 @@ class VaeDecodeTextureTrellis(IO.ComfyNode):
         sample_tensor = samples["samples"]
         device = comfy.model_management.get_torch_device()
         coords = samples["coords"]
+        _free_gpu()
         vae.prepare_decode(
             sample_tensor.shape,
             memory_required=_sparse_vae_decode_memory(shape_subdivides[-1].feats.shape[0], vae.vae_dtype),
@@ -271,6 +309,8 @@ class VaeDecodeTextureTrellis(IO.ComfyNode):
         voxel_coords = voxel_coords.to(output_device)
         color_feats = color_feats.to(output_device)
         voxel = Types.VOXEL(voxel_coords, color_feats, tex_resolution)
+        del samples, coords, shape_subdivides, trellis_vae
+        _unload_patcher(vae.patcher)
         return IO.NodeOutput(voxel)
 
 class VaeDecodeStructureTrellis2(IO.ComfyNode):
@@ -294,6 +334,7 @@ class VaeDecodeStructureTrellis2(IO.ComfyNode):
         resolution = int(resolution)
         sample_tensor = samples["samples"]
         sample_tensor = sample_tensor[:, :8]
+        _free_gpu()
         batch_number = vae.prepare_decode(sample_tensor.shape)
         shape_vae = vae.first_stage_model
         load_device = comfy.model_management.get_torch_device()
@@ -313,7 +354,9 @@ class VaeDecodeStructureTrellis2(IO.ComfyNode):
         if current_res != resolution:
             ratio = current_res // resolution
             decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
-        voxel_data = decoded.squeeze(1).float()
+        voxel_data = decoded.squeeze(1).float().to(comfy.model_management.intermediate_device())
+        del decoded, decoded_batches, sample_tensor, shape_vae
+        _unload_patcher(vae.patcher)
         return IO.NodeOutput(Types.VOXEL(voxel_data))
 
 class Trellis2UpsampleStage(IO.ComfyNode):
@@ -359,6 +402,7 @@ class Trellis2UpsampleStage(IO.ComfyNode):
     @classmethod
     def execute(cls, positive, negative, shape_latent, vae, target_resolution):
         device = comfy.model_management.get_torch_device()
+        _free_gpu()
         vae.prepare_decode(shape_latent["samples"].shape)
 
         coord_counts = shape_latent.get("coord_counts")
@@ -398,6 +442,7 @@ class Trellis2UpsampleStage(IO.ComfyNode):
             qu[:, 0] = sample_offset
             per_sample_counts.append(int(qu.shape[0]))
         coords = torch.cat(quant_unique_list, dim=0)
+        del sample_hr_coords, quant_unique_list
         counts = torch.tensor(per_sample_counts, dtype=torch.int64)
         coord_resolution = hr_resolution // 16
 
@@ -413,12 +458,17 @@ class Trellis2UpsampleStage(IO.ComfyNode):
             extras["trellis2_proj_feats"] = compute_stage_proj_feats(
                 proj_pack, "shape_1024", coords=coords, coord_resolution=coord_resolution,
             )
+        extras = {k: _to_intermediate(v) for k, v in extras.items()}
+        coords = extras["trellis2_coords"]
+        counts = extras["trellis2_coord_counts"]
         positive_out = _conditioning_set_extras(positive, extras)
         negative_out = _conditioning_set_extras(negative, extras)
         out_latent = {"samples": latent, "coords": coords, "coord_counts": counts,
                       "coord_resolution": coord_resolution, "type": "trellis2",
                       "model_frame": shape_latent.get("model_frame",
                                                        "y_up" if proj_pack is not None else "z_up")}
+        del shape_vae
+        _unload_patcher(vae.patcher)
         return IO.NodeOutput(positive_out, negative_out, out_latent)
 
 def _dinov3_encode(model, image_bchw, image_size, want_patches=False):
@@ -468,6 +518,7 @@ class Trellis2Conditioning(IO.ComfyNode):
 
         positive = [[cond_512_batched, {"embeds": cond_1024_batched}]]
         negative = [[neg_cond_batched, {"embeds": neg_embeds_batched}]]
+        _unload_patcher(clip_vision_model.patcher)
         return IO.NodeOutput(positive, negative)
 
 def _proj_pack_from_conditioning(conditioning):
@@ -624,6 +675,9 @@ class Trellis2TextureStage(IO.ComfyNode):
             extras["trellis2_proj_feats"] = compute_stage_proj_feats(
                 proj_pack, "tex_1024", coords=coords, coord_resolution=coord_resolution,
             )
+        extras = {k: _to_intermediate(v) for k, v in extras.items()}
+        coords = extras["trellis2_coords"]
+        counts = extras["trellis2_coord_counts"]
 
         positive_out = _conditioning_set_extras(positive, extras)
         negative_out = _conditioning_set_extras(negative, extras)
@@ -632,6 +686,7 @@ class Trellis2TextureStage(IO.ComfyNode):
                                                        "y_up" if proj_pack is not None else "z_up")}
         if coord_resolution is not None:
             out_latent["coord_resolution"] = coord_resolution
+        _free_gpu()
         return IO.NodeOutput(positive_out, negative_out, out_latent)
 
 
@@ -791,7 +846,7 @@ class Pixal3DConditioning(IO.ComfyNode):
         # global_512 → SS/shape_512 cross-attn; global_1024 → shape_1024/tex_1024.
         ss_proj_feats = compute_stage_proj_feats(
             proj_pack, "ss", dense_grid_resolution=16, batch_size=batch_size,
-            device=compute_device,
+            device=out_device,
         )
         neg_global = torch.zeros_like(global_512)
         neg_embeds = torch.zeros_like(global_1024)
@@ -805,6 +860,9 @@ class Pixal3DConditioning(IO.ComfyNode):
         }
         positive = [[global_512, base_extras]]
         negative = [[neg_global, neg_extras]]
+        _unload_patcher(clip_vision_model.patcher)
+        if naf_model is not None:
+            _unload_patcher(naf_model)
         return IO.NodeOutput(positive, negative)
 
 

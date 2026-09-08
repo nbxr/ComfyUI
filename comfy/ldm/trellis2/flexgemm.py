@@ -18,7 +18,9 @@ class TorchHashMap:
     """Sorted-array hashmap backed by torch.searchsorted."""
 
     def __init__(self, keys: torch.Tensor, values: torch.Tensor):
-        self.sorted_keys, order = torch.sort(keys.to(torch.long))
+        keys = keys.to(torch.long)
+        values = values.to(device=keys.device)
+        self.sorted_keys, order = torch.sort(keys)
         self.sorted_vals = values[order]
         self._n = self.sorted_keys.numel()
 
@@ -39,7 +41,11 @@ class TorchHashMap:
             found = in_range & (self.sorted_keys[idx] == flat_chunk)
             if found.any():
                 found_idx = found.nonzero(as_tuple=True)[0]
-                out[s + found_idx] = self.sorted_vals[idx[found_idx]].to(torch.int32)
+                if found_idx.device != out.device:
+                    found_idx = found_idx.to(out.device)
+                    idx = idx.to(out.device)
+                vals = self.sorted_vals.to(out.device)
+                out[s + found_idx] = vals[idx[found_idx]].to(torch.int32)
         return out
 
 
@@ -94,6 +100,7 @@ def sparse_submanifold_conv3d(
     neighbor_cache: Optional[torch.Tensor],
     dilation: tuple,
     cache_neighbor_map: bool = True,
+    output_device=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     if feats.shape[0] == 0:
         Co = weight.shape[0]
@@ -104,6 +111,8 @@ def sparse_submanifold_conv3d(
     Co, Kw, Kh, Kd, Ci = weight.shape
     V = Kw * Kh * Kd
     device = feats.device
+    if coords.device != device:
+        coords = coords.to(device)
 
     hashmap = None
     if neighbor_cache is None:
@@ -116,7 +125,7 @@ def sparse_submanifold_conv3d(
         flat_keys.add_(coords[:, 1], alpha=x_stride)
         flat_keys.add_(coords[:, 2], alpha=y_stride)
         flat_keys.add_(coords[:, 3], alpha=z_stride)
-        vals = torch.arange(coords.shape[0], dtype=torch.int32, device=device)
+        vals = torch.arange(coords.shape[0], dtype=torch.int32, device=coords.device)
         hashmap = TorchHashMap(flat_keys, vals)
 
         if cache_neighbor_map:
@@ -136,7 +145,12 @@ def sparse_submanifold_conv3d(
     if torch.version.hip is not None:
         weight_T = weight_T.contiguous()
 
-    output = torch.empty(N_pts, Co, device=device, dtype=feats.dtype)
+    out_dev = device if output_device is None else output_device
+    out_bytes = N_pts * Co * feats.element_size()
+    if (output_device is None and device.type == "cuda"
+            and out_bytes > comfy.model_management.get_free_memory(device) // 2):
+        out_dev = torch.device("cpu")
+    output = torch.empty(N_pts, Co, device=out_dev, dtype=feats.dtype)
 
     # Chunk over voxels to bound the (chunk, V, Ci) gather.
     max_chunk_mem_gb = get_recommended_chunk_mem(device)
@@ -163,9 +177,10 @@ def sparse_submanifold_conv3d(
         gathered = feats[chunk_idx]                         # (chunk, V, Ci)
         gathered.masked_fill_(neighbor_chunk[:, :, None] < 0, 0)
         gathered_flat = gathered.view(actual_chunk, V * Ci)
-        output[start:end] = torch.matmul(gathered_flat, weight_T)  # (chunk, V*Ci) @ (V*Ci, Co)
+        chunk_out = torch.matmul(gathered_flat, weight_T)
+        output[start:end] = chunk_out if out_dev == device else chunk_out.to(out_dev)
 
     if bias is not None:
-        output += bias.unsqueeze(0).to(output.dtype)
+        output += bias.unsqueeze(0).to(device=output.device, dtype=output.dtype)
 
     return output, neighbor
